@@ -4,6 +4,11 @@ import com.alibaba.fastjson.JSONObject;
 import com.alibaba.fastjson.parser.ParserConfig;
 import com.auth0.jwt.JWT;
 import com.auth0.jwt.interfaces.DecodedJWT;
+import org.apache.commons.io.input.CharSequenceReader;
+import org.apache.commons.io.input.ReaderInputStream;
+import org.apache.commons.io.input.TeeInputStream;
+import org.apache.commons.io.output.LockableFileWriter;
+import org.apache.commons.io.output.WriterOutputStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
@@ -11,7 +16,8 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.web.bind.annotation.*;
 
 import javax.servlet.http.HttpServletRequest;
-import java.io.FileOutputStream;
+import java.io.*;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.LinkedHashMap;
@@ -24,79 +30,83 @@ public class App {
     static final Logger log = LoggerFactory.getLogger(App.class);
 
     public static void main(String[] args) {
-        // 开启 autoType，先验证 gadget chain 本身是否有效
-        // 结论确认后再测试 autoType=false 下的 Step1 类缓存污染绕过
         ParserConfig.getGlobalInstance().setAutoTypeSupport(true);
-        log.info("[BOOT] fastjson AutoType = {}", ParserConfig.getGlobalInstance().isAutoTypeSupport());
+        log.info("[BOOT] autoType={}", ParserConfig.getGlobalInstance().isAutoTypeSupport());
         SpringApplication.run(App.class, args);
     }
 
-    /** 复现 NotifyServiceImpl.java:150-154 */
+    /** 精确复现 NotifyServiceImpl.java:150-154 */
     @PostMapping("/notify/v2")
     public Map<String, Object> notifyV2(@RequestBody Map<String, String> body) {
-        Map<String, Object> result = new LinkedHashMap<>();
+        Map<String, Object> r = new LinkedHashMap<>();
         try {
             DecodedJWT jwt = JWT.decode(body.get("signedPayload"));
             String header = new String(Base64.getDecoder().decode(jwt.getHeader()), StandardCharsets.UTF_8);
-            log.info("[V2] header preview={}", header.substring(0, Math.min(80, header.length())));
+            log.info("[V2] header[0..80]={}", header.substring(0, Math.min(80, header.length())));
             JSONObject.parseObject(header);
-            result.put("code", 500);
-            result.put("msg", "NPE-parseObject已执行");
+            r.put("code", 500); r.put("msg", "ok-no-x5c");
         } catch (NullPointerException e) {
-            result.put("code", 500);
-            result.put("msg", "NPE-parseObject已执行");
+            r.put("code", 500); r.put("msg", "NPE-ok");
         } catch (Exception e) {
             log.error("[V2-ERR] {}:{}", e.getClass().getName(), e.getMessage());
-            result.put("code", 500);
-            result.put("type", e.getClass().getSimpleName());
-            result.put("msg", e.getMessage());
+            r.put("code", 500); r.put("type", e.getClass().getSimpleName()); r.put("msg", e.getMessage());
         }
-        return result;
+        return r;
+    }
+
+    /** 直接接收 fastjson JSON，绕过 JWT 包装 */
+    @PostMapping(value = "/raw", consumes = "*/*")
+    public Map<String, Object> raw(HttpServletRequest request) {
+        Map<String, Object> r = new LinkedHashMap<>();
+        try {
+            String json = new String(request.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            log.info("[RAW] len={} preview={}", json.length(), json.substring(0, Math.min(120, json.length())));
+            JSONObject.parseObject(json);
+            r.put("ok", true);
+        } catch (Exception e) {
+            log.error("[RAW-ERR] {}:{}", e.getClass().getName(), e.getMessage());
+            r.put("ok", false); r.put("type", e.getClass().getSimpleName()); r.put("msg", e.getMessage());
+        }
+        return r;
     }
 
     /**
-     * 直接接收 fastjson JSON（text/plain），绕过 JWT 包装。
-     * autoType 状态跟随 main() 的设置。
+     * 纯 Java 验证 commons-io 写文件链是否可行（无 fastjson，直接调用 API）。
+     * POST {"file":"/tmp/java_test","content":"hello"}
      */
-    @PostMapping(value = "/raw", consumes = {"text/plain", "application/octet-stream", "*/*"})
-    public Map<String, Object> raw(HttpServletRequest request) {
-        Map<String, Object> result = new LinkedHashMap<>();
+    @PostMapping("/diag/chain")
+    public Map<String, Object> diagChain(@RequestBody Map<String, String> body) {
+        Map<String, Object> r = new LinkedHashMap<>();
+        String file = body.getOrDefault("file", "/tmp/chain_test");
+        String content = body.getOrDefault("content", "CHAIN-TEST\n");
         try {
-            byte[] bytes = request.getInputStream().readAllBytes();
-            String json = new String(bytes, StandardCharsets.UTF_8);
-            log.info("[RAW] len={} autoType={} preview={}",
-                    json.length(),
-                    ParserConfig.getGlobalInstance().isAutoTypeSupport(),
-                    json.substring(0, Math.min(100, json.length())));
+            // 完全模拟 gadget chain 的数据流，用 Java API 直接调用
+            CharSequenceReader csReader = new CharSequenceReader(content);
+            // 填充到 8193 确保 flush
+            String padded = content + " ".repeat(Math.max(0, 8193 - content.length()));
+            csReader = new CharSequenceReader(padded);
 
-            JSONObject.parseObject(json);
+            Charset cs = Charset.forName("iso-8859-1");
+            ReaderInputStream ris = new ReaderInputStream(csReader, cs, 1);
 
-            result.put("ok", true);
-            result.put("autoType", ParserConfig.getGlobalInstance().isAutoTypeSupport());
+            LockableFileWriter lfw = new LockableFileWriter(new File(file), "iso-8859-1", false, "/tmp");
+            WriterOutputStream wos = new WriterOutputStream(lfw, cs, 1, true);
+
+            TeeInputStream tee = new TeeInputStream(ris, wos, true);
+
+            // 读完整流（模拟 XmlStreamReader 触发）
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = tee.read(buf)) != -1) {}
+            tee.close();
+
+            r.put("ok", true);
+            r.put("file", file);
+            log.info("[CHAIN] wrote {} -> ok", file);
         } catch (Exception e) {
-            log.error("[RAW-ERR] {}:{}", e.getClass().getName(), e.getMessage());
-            result.put("ok", false);
-            result.put("type", e.getClass().getSimpleName());
-            result.put("msg", e.getMessage());
+            log.error("[CHAIN-ERR] {}:{}", e.getClass().getName(), e.getMessage());
+            r.put("ok", false); r.put("type", e.getClass().getSimpleName()); r.put("msg", e.getMessage());
         }
-        return result;
-    }
-
-    /** 验证 Java 进程写文件权限，与 fastjson 无关 */
-    @PostMapping("/diag/write")
-    public Map<String, Object> diagWrite(@RequestBody Map<String, String> body) {
-        String file = body.getOrDefault("file", "/tmp/diag_test");
-        Map<String, Object> result = new LinkedHashMap<>();
-        try {
-            try (FileOutputStream fos = new FileOutputStream(file)) {
-                fos.write("java-write-ok\n".getBytes(StandardCharsets.UTF_8));
-            }
-            result.put("ok", true);
-            result.put("file", file);
-        } catch (Exception e) {
-            result.put("ok", false);
-            result.put("msg", e.getMessage());
-        }
-        return result;
+        return r;
     }
 }
