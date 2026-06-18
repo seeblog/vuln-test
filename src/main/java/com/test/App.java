@@ -24,37 +24,27 @@ public class App {
     static final Logger log = LoggerFactory.getLogger(App.class);
 
     public static void main(String[] args) {
-        // 故意不开启 autoTypeSupport，测试 expectClass 绕过路径（CVE-2022-25845 的真实机制）
-        log.info("[BOOT] fastjson version check, AutoType = {}", ParserConfig.getGlobalInstance().isAutoTypeSupport());
+        // 开启 autoType，先验证 gadget chain 本身是否有效
+        // 结论确认后再测试 autoType=false 下的 Step1 类缓存污染绕过
+        ParserConfig.getGlobalInstance().setAutoTypeSupport(true);
+        log.info("[BOOT] fastjson AutoType = {}", ParserConfig.getGlobalInstance().isAutoTypeSupport());
         SpringApplication.run(App.class, args);
     }
 
-    /**
-     * 精确复现 NotifyServiceImpl.java:150-154
-     * JWT header -> Base64.getDecoder() -> JSONObject.parseObject()
-     */
+    /** 复现 NotifyServiceImpl.java:150-154 */
     @PostMapping("/notify/v2")
     public Map<String, Object> notifyV2(@RequestBody Map<String, String> body) {
         Map<String, Object> result = new LinkedHashMap<>();
         try {
             DecodedJWT jwt = JWT.decode(body.get("signedPayload"));
-            log.info("[V2-1] JWT.decode OK");
-
             String header = new String(Base64.getDecoder().decode(jwt.getHeader()), StandardCharsets.UTF_8);
-            log.info("[V2-2] header decoded len={} preview={}", header.length(),
-                    header.substring(0, Math.min(80, header.length())));
-
-            log.info("[V2-3] calling parseObject...");
-            JSONObject parsed = JSONObject.parseObject(header);
-            log.info("[V2-4] parseObject OK keys={}", parsed.keySet());
-
-            parsed.getJSONArray("x5c").getString(0); // 触发 NPE（正常业务）
-            result.put("code", 200);
-
-        } catch (NullPointerException e) {
-            log.warn("[V2-NPE] {} at {}", e.getMessage(), e.getStackTrace()[0]);
+            log.info("[V2] header preview={}", header.substring(0, Math.min(80, header.length())));
+            JSONObject.parseObject(header);
             result.put("code", 500);
-            result.put("msg", "NPE-parseObject已执行完毕");
+            result.put("msg", "NPE-parseObject已执行");
+        } catch (NullPointerException e) {
+            result.put("code", 500);
+            result.put("msg", "NPE-parseObject已执行");
         } catch (Exception e) {
             log.error("[V2-ERR] {}:{}", e.getClass().getName(), e.getMessage());
             result.put("code", 500);
@@ -65,13 +55,8 @@ public class App {
     }
 
     /**
-     * 直接接收 fastjson payload（text/plain），跳过 JWT 包装。
-     * 用于独立验证 fastjson JSON 语法和 gadget chain，与 JWT 编码问题解耦。
-     *
-     * Python 端用法：
-     *   curl -X POST http://host:12300/raw \
-     *        -H 'Content-Type: text/plain' \
-     *        --data-binary @step2.json
+     * 直接接收 fastjson JSON（text/plain），绕过 JWT 包装。
+     * autoType 状态跟随 main() 的设置。
      */
     @PostMapping(value = "/raw", consumes = {"text/plain", "application/octet-stream", "*/*"})
     public Map<String, Object> raw(HttpServletRequest request) {
@@ -79,15 +64,15 @@ public class App {
         try {
             byte[] bytes = request.getInputStream().readAllBytes();
             String json = new String(bytes, StandardCharsets.UTF_8);
-            log.info("[RAW] len={} preview={}", json.length(),
+            log.info("[RAW] len={} autoType={} preview={}",
+                    json.length(),
+                    ParserConfig.getGlobalInstance().isAutoTypeSupport(),
                     json.substring(0, Math.min(100, json.length())));
 
             JSONObject.parseObject(json);
 
             result.put("ok", true);
-            result.put("msg", "parseObject completed");
             result.put("autoType", ParserConfig.getGlobalInstance().isAutoTypeSupport());
-
         } catch (Exception e) {
             log.error("[RAW-ERR] {}:{}", e.getClass().getName(), e.getMessage());
             result.put("ok", false);
@@ -97,7 +82,7 @@ public class App {
         return result;
     }
 
-    /** 验证 Java 进程的文件写入权限，与 fastjson 无关 */
+    /** 验证 Java 进程写文件权限，与 fastjson 无关 */
     @PostMapping("/diag/write")
     public Map<String, Object> diagWrite(@RequestBody Map<String, String> body) {
         String file = body.getOrDefault("file", "/tmp/diag_test");
